@@ -1,3 +1,0 @@
-imagesource:GoogleEarth
-gsd:1.34110450745e-06
-695 536 1084 468 1143 698 750 766 plane 0

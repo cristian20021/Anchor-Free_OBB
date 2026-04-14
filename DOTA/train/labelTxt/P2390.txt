@@ -1,3 +1,0 @@
-imagesource:GoogleEarth
-gsd:0.557931689045
-901 1045 929 1045 929 1075 901 1075 storage-tank 0

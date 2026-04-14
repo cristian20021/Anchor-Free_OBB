@@ -1,3 +1,0 @@
-imagesource:GoogleEarth
-gsd:0.95669028402
-2311 260 2348 270 2343 297 2304 288 bridge 0

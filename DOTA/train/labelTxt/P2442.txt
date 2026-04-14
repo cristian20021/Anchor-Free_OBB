@@ -1,3 +1,0 @@
-imagesource:GoogleEarth
-gsd:0.971327993843
-12 373 52 373 52 413 12 413 roundabout 0
