@@ -8,7 +8,8 @@ import torchvision.transforms as transforms
 from backbone import VGGBackbone, FPN, device
 from head import OBBHead
 from loss import gwd_loss
-
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 DOTA_CLASSES = [
     'plane', 'baseball-diamond', 'bridge', 'ground-track-field',
@@ -150,7 +151,7 @@ class DOTADataset(Dataset):
 
         return image, boxes, labels
 
-# --- Pipeline ---
+
 def run_epoch(dataloader, backbone, fpn, head, img_size, optimizer=None, split="train"):
     """Run one epoch of training, validation, or testing."""
     is_train = (split == "train")
@@ -170,64 +171,142 @@ def run_epoch(dataloader, backbone, fpn, head, img_size, optimizer=None, split="
     with context:
         for images, gt_boxes_list, gt_labels_list in dataloader:
             images = images.to(device)
-            # Move each image's boxes/labels to device (variable length per image)
             gt_boxes_list = [b.to(device) for b in gt_boxes_list]
-            gt_labels_list = [l.to(device) for l in gt_labels_list]  # noqa: E741
+            gt_labels_list = [l.to(device) for l in gt_labels_list]
 
             c3, c4, c5 = backbone(images)
             p3, p4, p5, p6 = fpn(c3, c4, c5)
             features = [p3, p4, p5, p6]
             out_cls, out_ctr, out_reg = head(features)
 
-            # Concatenate all GT boxes across the batch for loss computation
-            # Skip images with no annotations
-            all_gt = [b for b in gt_boxes_list if b.shape[0] > 0]
-            if len(all_gt) == 0:
-                continue
-            gt_boxes_cat = torch.cat(all_gt, dim=0)
-
-            # Use P3 feature map for regression
-            reg0 = out_reg[0]  # (B, 5, H, W) from P3
-            B, C, H, W = reg0.shape
-            reg_flat = reg0.permute(0, 2, 3, 1).reshape(-1, 5)  # (B*H*W, 5)
+            if split in ["test", "validation"]:
+                batch_pred_boxes = []
+                batch_pred_labels = []
+                batch_pred_scores = []
+                
+                # We need to process each image in the batch individually
+                for b in range(B):
+                    all_boxes, all_cls, all_ctr = [], [], []
+                    
+                    # 1. Loop through all 4 FPN levels (P3, P4, P5, P6)
+                    for i in range(4):
+                        stride = head.STRIDES[i]
+                        _, _, H, W = out_reg[i].shape
+                        
+                        # Generate the grid centers for this feature map
+                        grid_y, grid_x = torch.meshgrid(
+                            torch.arange(H, device=device), 
+                            torch.arange(W, device=device),
+                            indexing='ij'
+                        )
+                        grid_cx = (grid_x.float() + 0.5) * stride
+                        grid_cy = (grid_y.float() + 0.5) * stride
+                        
+                        # Flatten and extract predictions for this image
+                        reg_flat = out_reg[i][b].permute(1, 2, 0).reshape(-1, 5)
+                        cls_flat = out_cls[i][b].permute(1, 2, 0).reshape(-1, len(DOTA_CLASSES))
+                        ctr_flat = out_ctr[i][b].permute(1, 2, 0).reshape(-1, 1)
+                        
+                        # Decode (l, t, r, b, theta) into (cx, cy, w, h, theta)
+                        l, t, r, b_var, theta = reg_flat.unbind(dim=-1)
+                        cx_pred = grid_cx.flatten() + (r - l) / 2.0
+                        cy_pred = grid_cy.flatten() + (b_var - t) / 2.0
+                        w_pred = l + r
+                        h_pred = t + b_var
+                        
+                        decoded_boxes = torch.stack([cx_pred, cy_pred, w_pred, h_pred, theta], dim=-1)
+                        
+                        all_boxes.append(decoded_boxes)
+                        all_cls.append(cls_flat)
+                        all_ctr.append(ctr_flat)
+                        
+                    # 2. Concatenate all levels together
+                    all_boxes = torch.cat(all_boxes, dim=0)
+                    all_cls = torch.cat(all_cls, dim=0)
+                    all_ctr = torch.cat(all_ctr, dim=0)
+                    
+                    # 3. Apply the NMS and Filtering (from Step 2)
+                    from visualize import apply_nms_and_filter # Assuming you put it in visualize.py
+                    clean_boxes, clean_labels, clean_scores = apply_nms_and_filter(
+                        all_boxes, all_cls, all_ctr, conf_thresh=0.6, iou_thresh=0.01
+                    ) # conf_thresh = 0.05 iou_thresh = 0.1
+                    
+                    batch_pred_boxes.append(clean_boxes)
+                    batch_pred_labels.append(clean_labels)
+                    batch_pred_scores.append(clean_scores)
+                    
+                continue 
             
-            # Create grid of (x, y) centers for each spatial location
+            reg0 = out_reg[0]  
+            B, C, H, W = reg0.shape
+            
+            reg_flat = reg0.permute(0, 2, 3, 1).reshape(B, -1, 5)  
+            
             stride = img_size // H  # P3 stride
             grid_y, grid_x = torch.meshgrid(
                 torch.arange(H, device=device), 
                 torch.arange(W, device=device),
                 indexing='ij'
             )
-            # Center coordinates of each grid cell
             grid_centers = torch.stack([
                 (grid_x.float() + 0.5) * stride,
                 (grid_y.float() + 0.5) * stride
             ], dim=-1).reshape(-1, 2)  # (H*W, 2)
             
-            # For each GT box, find the nearest grid cell
-            gt_centers = gt_boxes_cat[:, :2]  # (n_gt, 2) - cx, cy
-            
-            # Compute distances: (n_gt, H*W)
-            dists = torch.cdist(gt_centers, grid_centers)
-            nearest_idx = dists.argmin(dim=1)  # (n_gt,)
-            
-            # Get predictions at the assigned locations
-            pred_boxes = reg_flat[nearest_idx]  # (n_gt, 5)
-            
-            loss = gwd_loss(pred_boxes, gt_boxes_cat)
+            batch_loss = 0.0
+            valid_images = 0
 
-            if is_train and optimizer is not None:
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+            # Process loss per image to avoid cross-batch index mixing
+            for b in range(B):
+                gt_boxes = gt_boxes_list[b]
+                if gt_boxes.shape[0] == 0:
+                    continue
+                
+                valid_images += 1
+                gt_centers = gt_boxes[:, :2]  # (n_gt, 2)
+                
+                # Match Ground Truth to nearest grid center
+                dists = torch.cdist(gt_centers, grid_centers)
+                nearest_idx = dists.argmin(dim=1)  # (n_gt,)
+                
+                # Extract predictions and matched anchor coordinates
+                pred_raw = reg_flat[b][nearest_idx]  # (n_gt, 5) -> [l, t, r, b, theta]
+                matched_centers = grid_centers[nearest_idx]  # (n_gt, 2) -> [grid_cx, grid_cy]
+                
+                # --- FIX 1: Decode (l, t, r, b) into (cx, cy, w, h) ---
+                l = pred_raw[:, 0]
+                t = pred_raw[:, 1]
+                r = pred_raw[:, 2]
+                b_var = pred_raw[:, 3]
+                theta = pred_raw[:, 4]
+                
+                grid_cx = matched_centers[:, 0]
+                grid_cy = matched_centers[:, 1]
+                
+                cx_pred = grid_cx + (r - l) / 2.0
+                cy_pred = grid_cy + (b_var - t) / 2.0
+                w_pred = l + r
+                h_pred = t + b_var
+                
+                # Stack back into format expected by loss.py: [cx, cy, w, h, theta]
+                pred_boxes_obb = torch.stack([cx_pred, cy_pred, w_pred, h_pred, theta], dim=-1)
+                
+                batch_loss += gwd_loss(pred_boxes_obb, gt_boxes)
 
-            total_loss += loss.item()
-            num_batches += 1
+            if valid_images > 0:
+                loss = batch_loss / valid_images
+                
+                if is_train and optimizer is not None:
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+                total_loss += loss.item()
+                num_batches += 1
 
     avg_loss = total_loss / max(num_batches, 1)
     print(f"[{split.upper()}] Avg Loss: {avg_loss:.4f}")
     return avg_loss
-
 
 def collate_fn(batch):
     """Custom collate: images are stacked, boxes/labels stay as lists (variable length)."""
@@ -237,17 +316,17 @@ def collate_fn(batch):
 
 
 def main():
-    # Use mini dataset if available, otherwise full DOTA
+
     import os
-    dota_root = 'DOTA_mini' if os.path.isdir('DOTA_mini') else 'DOTA'
+    dota_root = 'DOTA'
     print(f"Using dataset: {dota_root}")
     
-    num_epochs = 10
+    num_epochs = 100
     lr = 1e-4
 
     # Use smaller images on CPU for testing, full size on GPU
     img_size = 1024 if torch.cuda.is_available() else 256
-    batch_size = 2 if torch.cuda.is_available() else 1
+    batch_size = 32 if torch.cuda.is_available() else 1
     num_workers = 2 if torch.cuda.is_available() else 0
     print(f"Image size: {img_size}, Batch size: {batch_size}, Device: {device}")
 
@@ -279,7 +358,7 @@ def main():
     for epoch in range(1, num_epochs + 1):
         print(f"\n=== Epoch {epoch}/{num_epochs} ===")
         run_epoch(train_loader, backbone, fpn, head, img_size, optimizer=optimizer, split="train")
-        run_epoch(val_loader,   backbone, fpn, head, img_size, optimizer=None,     split="validation")
+        run_epoch(val_loader,   backbone, fpn, head, img_size, optimizer=None,      split="validation")
 
     print("\n=== Final Test ===")
     run_epoch(test_loader, backbone, fpn, head, img_size, optimizer=None, split="test")

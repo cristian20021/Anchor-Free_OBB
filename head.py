@@ -44,19 +44,22 @@ class OBBHead(nn.Module):
         self.scales = nn.ParameterList([nn.Parameter(torch.zeros(1)) for _ in range(4)])
 
     def forward(self, features):
-        # features: list of [P3, P4, P5, P6] tensors
-        out_cls, out_ctr, out_reg = [], [], []
-        for i, feat in enumerate(features):
-            x = self.tower(feat)
-            out_cls.append(self.cls_head(x))
-            out_ctr.append(self.ctr_head(x))
+            out_cls, out_ctr, out_reg = [], [], []
+            for i, feat in enumerate(features):
+                x = self.tower(feat)
+                out_cls.append(self.cls_head(x))
+                out_ctr.append(self.ctr_head(x))
 
-            # TODO — apply exp-scale to the first 4 dims (l,t,r,b),
-            # leave θ (dim index 4) unscaled.
-            raw = self.reg_head(x)
-            ltrb = torch.exp(self.scales[i]) * raw[:, :4].exp()   # exp(scale) * raw[:, :4]
-            theta = raw[:, 4:5]
-            theta = theta.clamp(-math.pi / 2, 0)# raw[:, 4:5], clamped to (-π/2, 0]
-            out_reg.append(torch.cat([ltrb, theta], dim=1))
+                raw = self.reg_head(x)
+                
+                # FIX: Fetch the stride for this FPN level
+                stride = self.STRIDES[i] 
+                
+                # FIX: Multiply by stride to put initial boxes on the correct scale
+                ltrb = torch.exp(self.scales[i]) * raw[:, :4].exp() * stride 
+                
+                theta = raw[:, 4:5]
+                theta = theta.clamp(-math.pi / 2, 0)
+                out_reg.append(torch.cat([ltrb, theta], dim=1))
 
-        return out_cls, out_ctr, out_reg
+            return out_cls, out_ctr, out_reg

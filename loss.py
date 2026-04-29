@@ -27,43 +27,34 @@ def obb_to_gaussian(boxes):
     mu = torch.stack([cx, cy], dim=-1)  # (N, 2)
     return mu, sigma
 
-def gwd_loss(pred_boxes, gt_boxes, tau=2.0, eps=1e-6):
-    """
-    Wasserstein-2 distance between two sets of OBBs via their Gaussians.
-    """
+def gwd_loss(pred_boxes, gt_boxes, tau=1.0, eps=1e-6): # FIX: Change tau to 1.0
     mu1, sigma1 = obb_to_gaussian(pred_boxes)
     mu2, sigma2 = obb_to_gaussian(gt_boxes)
 
-  
-    # TODO — squared sum
     mean_dist = torch.sum((mu1 - mu2)**2, dim=-1)
 
-   
     sigma1 = sigma1 + eps * torch.eye(2, device=sigma1.device)
     sigma2 = sigma2 + eps * torch.eye(2, device=sigma2.device)
 
-    # TODO — compute sqrt of sigma1 via eigendecomposition.
-    eigvals1, eigvecs1 = torch.linalg.eigh(sigma1)
-    eigvals2, eigvecs2 = torch.linalg.eigh(sigma2)
     vals, vecs = torch.linalg.eigh(sigma1)
     vals = vals.clamp(min=0).sqrt()
-    sigma1_sqrt = torch.bmm(torch.bmm(vecs, torch.diag_embed(vals)), vecs.transpose(-1, -2))   # reconstruct: V · diag(sqrt(λ)) · Vᵀ
+    sigma1_sqrt = torch.bmm(torch.bmm(vecs, torch.diag_embed(vals)), vecs.transpose(-1, -2))
 
-    # TODO — compute the inner matrix M = sigma1_sqrt @ sigma2 @ sigma1_sqrt
     M = torch.bmm(torch.bmm(sigma1_sqrt, sigma2), sigma1_sqrt)
-
-    
     m_vals = torch.linalg.eigvalsh(M).clamp(min=0).sqrt()
-    trace_sqrt_M = m_vals.sum(dim=-1) # sum of sqrt of eigenvalues (clamp negatives to 0)
+    trace_sqrt_M = m_vals.sum(dim=-1)
+    
     tr1 = sigma1[:, 0, 0] + sigma1[:, 1, 1]
     tr2 = sigma2[:, 0, 0] + sigma2[:, 1, 1]
-    # TODO — assemble bures metric
-    bures = tr1 + tr2 - 2*trace_sqrt_M  
+    bures = tr1 + tr2 - 2 * trace_sqrt_M  
 
-    d_w = torch.sqrt((mean_dist + bures).clamp(min=0))
-    loss = 1 - 1 / (tau + d_w)
+    d_w = torch.sqrt((mean_dist + bures).clamp(min=1e-6))
+    
+    # FIX: Apply log transform to prevent vanishing gradients
+    f_d = torch.log1p(d_w) 
+    loss = 1 - 1 / (tau + f_d)
+    
     return loss.mean()
-
 
 def clip_polygon_by_edge(poly, edge_start, edge_end):
     """
