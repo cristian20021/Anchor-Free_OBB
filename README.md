@@ -173,12 +173,6 @@ opencv-python  # For advanced image processing
 
 **Slow Training**: Use GPU, increase `num_workers`, or reduce `img_size` for testing
 
-**Import Errors**: Install missing packages: `pip install -r requirements.txt`
 
-## References
 
-- [DOTA Dataset Home](https://captain-whu.github.io/DOTA/)
-- [DOTA Dataset Download](https://captain-whu.github.io/DOTA/dataset.html)
-- GWD Loss for Oriented Bounding Boxes
-- Feature Pyramid Networks (FPN)
-- Focal Loss for class imbalance
+
