@@ -200,7 +200,7 @@ def run_epoch(dataloader, backbone, fpn, head, img_size, optimizer=None, split="
             out_cls, out_ctr, out_reg = head(features)
             B = images.shape[0]
 
-            '''
+            
             NMS commented because the epochs were taking to long
             
             if split in ["test", "validation"]:
@@ -260,7 +260,7 @@ def run_epoch(dataloader, backbone, fpn, head, img_size, optimizer=None, split="
                     batch_pred_scores.append(clean_scores)
                     
                 continue 
-          '''  
+          
             reg0 = out_reg[0]
             cls0 = out_cls[0]
             B, C, H, W = reg0.shape
