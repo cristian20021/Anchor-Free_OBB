@@ -1,6 +1,8 @@
 
 import torch
 import math
+import torch.nn.functional as F
+
 def obb_to_gaussian(boxes):
     """
     boxes: (N, 5) tensor of (cx, cy, w, h, θ) in radians
@@ -137,3 +139,19 @@ def rotated_iou(box1, box2):
     area2 = (box2[2] * box2[3]).item()
     union = area1 + area2 - inter
     return inter / union if union > 0 else 0.0
+
+def focal_loss(inputs, targets, alpha=0.25, gamma=2.0):
+    """
+    inputs: (N, num_classes) raw logits from the network
+    targets: (N,) ground truth class indices
+    """
+    # Standard Cross Entropy
+    ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+    
+    # Calculate the probability of the correct class (pt)
+    pt = torch.exp(-ce_loss)
+    
+    # Apply the focal weight: (1 - pt)^gamma
+    f_loss = alpha * (1 - pt) ** gamma * ce_loss
+    
+    return f_loss.mean()

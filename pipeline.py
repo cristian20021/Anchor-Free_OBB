@@ -1,5 +1,8 @@
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
 import math
+import csv
 import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
@@ -9,6 +12,7 @@ from backbone import VGGBackbone, FPN, device
 from head import OBBHead
 from loss import gwd_loss
 from PIL import ImageFile
+from tqdm import tqdm
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 DOTA_CLASSES = [
@@ -58,7 +62,7 @@ def cv2_minAreaRect(pts):
         return (cx, cy), (d1, d2), angle
 
 
-def parse_dota_annotation(ann_path, orig_w, orig_h, target_size=1024):
+def parse_dota_annotation(ann_path):
     """
     Parse a DOTA label .txt file.
     Returns:
@@ -66,7 +70,6 @@ def parse_dota_annotation(ann_path, orig_w, orig_h, target_size=1024):
         labels – (N,)   tensor  class indices
     """
     boxes, labels = [], []
-    sx, sy = target_size / orig_w, target_size / orig_h
 
     with open(ann_path, 'r') as f:
         for line in f:
@@ -85,10 +88,10 @@ def parse_dota_annotation(ann_path, orig_w, orig_h, target_size=1024):
                 continue
 
             # Scale corners to the resized image
-            x1, y1 = coords[0] * sx, coords[1] * sy
-            x2, y2 = coords[2] * sx, coords[3] * sy
-            x3, y3 = coords[4] * sx, coords[5] * sy
-            x4, y4 = coords[6] * sx, coords[7] * sy
+            x1, y1 = coords[0], coords[1]
+            x2, y2 = coords[2], coords[3]
+            x3, y3 = coords[4], coords[5]
+            x4, y4 = coords[6], coords[7]
 
             cx, cy, w, h, theta = corners_to_obb(x1, y1, x2, y2, x3, y3, x4, y4)
             boxes.append([cx, cy, w, h, theta])
@@ -131,6 +134,16 @@ class DOTADataset(Dataset):
         image = Image.open(img_path).convert('RGB')
         orig_w, orig_h = image.size
 
+        max_size = max(orig_w, orig_h)
+        pad_x = (max_size - orig_w) // 2
+        pad_y = (max_size - orig_h) // 2
+        scale = self.target_size / max_size
+
+        padded_img = Image.new("RGB", (max_size, max_size), (0, 0, 0))
+        padded_img.paste(image, (pad_x, pad_y))
+
+        image = padded_img.resize((self.target_size, self.target_size), Image.BILINEAR)
+        
         if self.transform:
             image = self.transform(image)
 
@@ -139,9 +152,16 @@ class DOTADataset(Dataset):
             ann_name = os.path.splitext(img_name)[0] + '.txt'
             ann_path = os.path.join(self.ann_dir, ann_name)
             if os.path.exists(ann_path):
-                boxes, labels = parse_dota_annotation(
-                    ann_path, orig_w, orig_h, self.target_size
-                )
+                boxes, labels = parse_dota_annotation(ann_path)
+
+                if len(boxes) > 0:
+                    cx = (boxes[:, 0] + pad_x) * scale
+                    cy = (boxes[:, 1] + pad_y) * scale
+                    w  = boxes[:, 2] * scale
+                    h  = boxes[:, 3] * scale
+                    theta = boxes[:, 4]
+
+                    boxes = torch.stack([cx, cy, w, h, theta], dim=-1)
             else:
                 boxes = torch.zeros((0, 5), dtype=torch.float32)
                 labels = torch.zeros((0,), dtype=torch.long)
@@ -169,7 +189,7 @@ def run_epoch(dataloader, backbone, fpn, head, img_size, optimizer=None, split="
 
     context = torch.no_grad() if not is_train else torch.enable_grad()
     with context:
-        for images, gt_boxes_list, gt_labels_list in dataloader:
+        for images, gt_boxes_list, gt_labels_list in tqdm(dataloader, desc=split.upper()):
             images = images.to(device)
             gt_boxes_list = [b.to(device) for b in gt_boxes_list]
             gt_labels_list = [l.to(device) for l in gt_labels_list]
@@ -178,7 +198,11 @@ def run_epoch(dataloader, backbone, fpn, head, img_size, optimizer=None, split="
             p3, p4, p5, p6 = fpn(c3, c4, c5)
             features = [p3, p4, p5, p6]
             out_cls, out_ctr, out_reg = head(features)
+            B = images.shape[0]
 
+            '''
+            NMS commented because the epochs were taking to long
+            
             if split in ["test", "validation"]:
                 batch_pred_boxes = []
                 batch_pred_labels = []
@@ -236,11 +260,13 @@ def run_epoch(dataloader, backbone, fpn, head, img_size, optimizer=None, split="
                     batch_pred_scores.append(clean_scores)
                     
                 continue 
-            
-            reg0 = out_reg[0]  
+          '''  
+            reg0 = out_reg[0]
+            cls0 = out_cls[0]
             B, C, H, W = reg0.shape
             
             reg_flat = reg0.permute(0, 2, 3, 1).reshape(B, -1, 5)  
+            cls_flat = cls0.permute(0, 2, 3, 1).reshape(B, -1, len(DOTA_CLASSES))
             
             stride = img_size // H  # P3 stride
             grid_y, grid_x = torch.meshgrid(
@@ -271,6 +297,8 @@ def run_epoch(dataloader, backbone, fpn, head, img_size, optimizer=None, split="
                 
                 # Extract predictions and matched anchor coordinates
                 pred_raw = reg_flat[b][nearest_idx]  # (n_gt, 5) -> [l, t, r, b, theta]
+                pred_cls_raw = cls_flat[b][nearest_idx]
+                
                 matched_centers = grid_centers[nearest_idx]  # (n_gt, 2) -> [grid_cx, grid_cy]
                 
                 # --- FIX 1: Decode (l, t, r, b) into (cx, cy, w, h) ---
@@ -290,8 +318,15 @@ def run_epoch(dataloader, backbone, fpn, head, img_size, optimizer=None, split="
                 
                 # Stack back into format expected by loss.py: [cx, cy, w, h, theta]
                 pred_boxes_obb = torch.stack([cx_pred, cy_pred, w_pred, h_pred, theta], dim=-1)
+
+                from loss import focal_loss
+
+                gt_classes = gt_labels_list[b]
+
+                loss_box = gwd_loss(pred_boxes_obb, gt_boxes)
+                loss_cls = focal_loss(pred_cls_raw, gt_classes)
                 
-                batch_loss += gwd_loss(pred_boxes_obb, gt_boxes)
+                batch_loss += (loss_box + loss_cls)
 
             if valid_images > 0:
                 loss = batch_loss / valid_images
@@ -304,7 +339,10 @@ def run_epoch(dataloader, backbone, fpn, head, img_size, optimizer=None, split="
                 total_loss += loss.item()
                 num_batches += 1
 
-    avg_loss = total_loss / max(num_batches, 1)
+    if num_batches == 0:
+        print(f"[{split.upper()}] Avg Loss: N/A  (no annotated batches found)")
+        return None
+    avg_loss = total_loss / num_batches # was max(num_batches, 1)
     print(f"[{split.upper()}] Avg Loss: {avg_loss:.4f}")
     return avg_loss
 
@@ -321,18 +359,17 @@ def main():
     dota_root = 'DOTA'
     print(f"Using dataset: {dota_root}")
     
-    num_epochs = 100
+    num_epochs = 60
     lr = 1e-4
 
     # Use smaller images on CPU for testing, full size on GPU
     img_size = 1024 if torch.cuda.is_available() else 256
-    batch_size = 32 if torch.cuda.is_available() else 1
-    num_workers = 2 if torch.cuda.is_available() else 0
+    batch_size = 4 if torch.cuda.is_available() else 1
+    num_workers = 4 if torch.cuda.is_available() else 0
     print(f"Image size: {img_size}, Batch size: {batch_size}, Device: {device}")
 
 
     transform = transforms.Compose([
-        transforms.Resize((img_size, img_size)),
         transforms.ToTensor()
     ])
 
@@ -341,8 +378,8 @@ def main():
     val_dataset   = DOTADataset(dota_root, split="validation", transform=transform, target_size=img_size)
     test_dataset  = DOTADataset(dota_root, split="test",       transform=transform, target_size=img_size)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,  num_workers=num_workers, collate_fn=collate_fn)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,  num_workers=num_workers, collate_fn=collate_fn, pin_memory=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn, pin_memory=True)
     test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn)
 
   
@@ -354,15 +391,38 @@ def main():
     params = list(backbone.parameters()) + list(fpn.parameters()) + list(head.parameters())
     optimizer = torch.optim.Adam([p for p in params if p.requires_grad], lr=lr)
 
+    save_interval = 15 #checkpoints for inference
+    pth_dir = "checkpoints"
+    csv_filename = "training_log.csv" #run logger
+    
+
+    with open(csv_filename, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["Epoch", "Train_Loss", "Validation_Loss"])
     
     for epoch in range(1, num_epochs + 1):
         print(f"\n=== Epoch {epoch}/{num_epochs} ===")
-        run_epoch(train_loader, backbone, fpn, head, img_size, optimizer=optimizer, split="train")
-        run_epoch(val_loader,   backbone, fpn, head, img_size, optimizer=None,      split="validation")
+        train_loss=run_epoch(train_loader, backbone, fpn, head, img_size, optimizer=optimizer, split="train")
+        val_loss=run_epoch(val_loader,   backbone, fpn, head, img_size, optimizer=None,      split="validation")
+
+        with open(csv_filename, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([epoch, f"{train_loss:.4f}", f"{val_loss:.4f}"])
+
+        if epoch % save_interval == 0 or epoch == num_epochs:
+            print(f"Saving checkpoint for epoch {epoch}...")
+            checkpoint = {
+                'backbone': backbone.state_dict(),
+                'fpn': fpn.state_dict(),
+                'head': head.state_dict()
+            }
+            save_path = os.path.join(pth_dir, f"dota_weights_epoch_{epoch}.pth")
+            torch.save(checkpoint, save_path)
 
     print("\n=== Final Test ===")
     run_epoch(test_loader, backbone, fpn, head, img_size, optimizer=None, split="test")
-
+    #run_epoch(val_loader, backbone, fpn, head, img_size, optimizer=None, split="validation") #split was test; testing validation which has labels to see loss -> final avg loss == last epoch avg loss 
+    
 
 if __name__ == "__main__":
     main()

@@ -96,22 +96,42 @@ def apply_nms_and_filter(pred_boxes, pred_cls, pred_ctr, conf_thresh=0.05, iou_t
 
     return boxes[keep_indices], labels[keep_indices], scores[keep_indices]
 
-def visualize_batch(images, boxes_list, labels_list, class_names=DOTA_CLASSES):
-    """
-    Visualizes a batch of images with their oriented bounding boxes.
-    """
+def visualize_batch(images, boxes_list, labels_list, class_names=DOTA_CLASSES, batch_idx=0):
+
     batch_size = len(images)
-    fig, axes = plt.subplots(1, batch_size, figsize=(6 * batch_size, 6))
     
-    # Handle single-item batches gracefully
+    # 1. CREATE HORIZONTAL GRID FOR ORIGINALS
+    fig_orig, axes_orig = plt.subplots(1, batch_size, figsize=(6 * batch_size, 6))
+    
+    # Handle single-item batches gracefully so it doesn't crash
     if batch_size == 1:
-        axes = [axes]
+        axes_orig = [axes_orig]
         
     for i in range(batch_size):
-        ax = axes[i]
-        
-        # Convert image tensor back to PIL for plotting
+        ax = axes_orig[i]
         img = to_pil_image(images[i])
+        
+        ax.imshow(img)
+        ax.axis('off')
+        ax.set_title(f"Original Image {i+1}", fontsize=14)
+        
+    plt.tight_layout()
+    orig_filename = f'original_batch_{batch_idx}.png'
+    fig_orig.savefig(orig_filename, bbox_inches='tight', dpi=150)
+    print(f"Saved clean original grid to: {orig_filename}")
+    plt.close(fig_orig) # Free memory
+    
+    # 2. CREATE HORIZONTAL GRID FOR ANNOTATED
+    
+    fig_anno, axes_anno = plt.subplots(1, batch_size, figsize=(6 * batch_size, 6))
+    
+    if batch_size == 1:
+        axes_anno = [axes_anno]
+        
+    for i in range(batch_size):
+        ax = axes_anno[i]
+        img = to_pil_image(images[i])
+        
         ax.imshow(img)
         
         boxes = boxes_list[i]
@@ -123,26 +143,24 @@ def visualize_batch(images, boxes_list, labels_list, class_names=DOTA_CLASSES):
             # Get corners for the polygon
             corners = obb_to_corners(cx, cy, w, h, theta)
             
-            # Draw the bounding box
-            poly = Polygon(corners, closed=True, edgecolor='lime', facecolor='none', linewidth=1)
+            # Draw the bounding box (Lime green)
+            poly = Polygon(corners, closed=True, edgecolor='lime', facecolor='none', linewidth=2)
             ax.add_patch(poly)
             
             # Draw the label background and text
             class_name = class_names[label.item()]
-            
-            # Place the text near the first corner
             ax.text(corners[0][0], corners[0][1], class_name, color='black', 
-                    bbox=dict(facecolor='lime', alpha=0.3, pad=0.25, edgecolor='none'), 
-                    fontsize=8)
+                    bbox=dict(facecolor='lime', alpha=0.5, pad=2, edgecolor='none'), 
+                    fontsize=10, fontweight='bold')
         
         ax.axis('off')
-        ax.set_title(f"Image {i+1} - Objects: {len(boxes)}")
+        ax.set_title(f"Image {i+1} - Objects: {len(boxes)}", fontsize=14)
         
     plt.tight_layout()
-    
-    # NEW: Save the file instead of trying to open a popup!
-    plt.savefig('visualized_boxes.png', bbox_inches='tight', dpi=150)
-    print("Saved visualization to 'visualized_boxes.png'")
+    anno_filename = f'annotated_batch_{batch_idx}.png'
+    fig_anno.savefig(anno_filename, bbox_inches='tight', dpi=150)
+    print(f"Saved annotated grid to: {anno_filename}")
+    plt.close(fig_anno) # Free memory
 
 def test_visualization():
     """
@@ -153,7 +171,6 @@ def test_visualization():
 
     
     transform = transforms.Compose([
-        transforms.Resize((img_size, img_size)),
         transforms.ToTensor()
     ])
     
@@ -161,14 +178,14 @@ def test_visualization():
     dataset = DOTADataset(dota_root, split="train", transform=transform, target_size=img_size)
     
     # Create a dataloader to grab a single batch of 2 images
-    loader = DataLoader(dataset, batch_size=6, shuffle=True, collate_fn=collate_fn)
+    loader = DataLoader(dataset, batch_size=6, shuffle=True, collate_fn=collate_fn, num_workers=4)
 
     # sample_image = image_loader("DOTA/test/images/P0006.png")
     print("Fetching batch...")
     images, boxes, labels = next(iter(loader))
 
     print(f"Visualizing {len(images)} images...")
-    visualize_batch(images, boxes, labels)
+    visualize_batch(images, boxes, labels, batch_idx=1)
 
 if __name__ == "__main__":
     test_visualization()
