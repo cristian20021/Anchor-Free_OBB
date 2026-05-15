@@ -18,7 +18,7 @@ An anchor-free object detector for aerial images that predicts oriented bounding
 1. **Clone/Setup**
    ```bash
    git clone https://github.com/cristian20021/Anchor-Free_OBB.git
-   cd Anchor-Free_OBB-main
+   cd Anchor-Free_OBB
    ```
 
 2. **Install Dependencies**
